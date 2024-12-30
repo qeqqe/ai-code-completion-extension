@@ -7,7 +7,7 @@ A VSCode extension for using LM Studio local LLM models directly in your editor 
 1. Clone the repository:
 
 ```bash
-git clone https://github.com/yourusername/lmstudio-completions.git
+git clone https://github.com/qeqqe/ai-code-completion-extension.git
 ```
 
 2. Install dependencies:
