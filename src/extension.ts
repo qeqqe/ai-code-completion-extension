@@ -4,6 +4,8 @@ import axios, { CancelTokenSource } from "axios";
 const LOCALHOST_URL = "http://localhost:1234/v1";
 const DEBOUNCE_DELAY = 300;
 
+const CONTEXT_BLOCK_SIZE = 20;
+
 const BASE_PROMPTS = {
   typescript: `You are a TypeScript code completion AI. Generate TypeScript code with:
 - Proper type annotations
@@ -72,6 +74,12 @@ class CompletionProvider implements vscode.InlineCompletionItemProvider {
   private lastRequest: CancelTokenSource | null = null;
   private debounceTimeout: NodeJS.Timeout | null = null;
   private currentLanguage: string = "javascript";
+  private lastDefinedFunction: {
+    name: string;
+    params: string[];
+    returnType?: string;
+    line: number;
+  } | null = null;
 
   constructor() {
     this.outputChannel = vscode.window.createOutputChannel(
@@ -179,6 +187,129 @@ class CompletionProvider implements vscode.InlineCompletionItemProvider {
     };
   }
 
+  private analyzeCodeBlock(
+    document: vscode.TextDocument,
+    position: vscode.Position
+  ): {
+    functionNames: string[];
+    variables: string[];
+    codeIntent: string;
+    recentlyDefinedFunction: boolean;
+  } {
+    const startLine = Math.max(0, position.line - CONTEXT_BLOCK_SIZE);
+    const contextText = document.getText(
+      new vscode.Range(new vscode.Position(startLine, 0), position)
+    );
+
+    const functionDeclarations =
+      contextText.match(
+        /(?:function|const|let|var)\s+(\w+)\s*(?:=\s*(?:async\s*)?\(([^)]*)\)|(?:async\s*)?\(([^)]*)\))/g
+      ) || [];
+
+    if (functionDeclarations.length > 0) {
+      const lastFn = functionDeclarations[functionDeclarations.length - 1];
+      const match = lastFn.match(/(\w+)\s*(?:=\s*)?(?:async\s*)?\(([^)]*)\)/);
+      if (match) {
+        this.lastDefinedFunction = {
+          name: match[1],
+          params: match[2].split(",").map((p) => p.trim()),
+          line: position.line - 1,
+        };
+      }
+    }
+
+    const recentlyDefinedFunction =
+      this.lastDefinedFunction?.line === position.line - 1;
+
+    const functionMatches =
+      contextText.match(/(?:function|const|let|var)\s+(\w+)/g) || [];
+    const functionNames = functionMatches.map((f) => f.split(/\s+/)[1]);
+
+    const varMatches =
+      contextText.match(/(?:const|let|var)\s+(\w+)\s*=/g) || [];
+    const variables = varMatches.map((v) => v.split(/\s+/)[1]);
+
+    const comments = this.getContextFromComments(document, position);
+    const codeIntent = comments || "Continue the logical flow";
+
+    return { functionNames, variables, codeIntent, recentlyDefinedFunction };
+  }
+
+  private isInsideComment(
+    document: vscode.TextDocument,
+    position: vscode.Position
+  ): boolean {
+    const line = document.lineAt(position.line).text;
+    const beforeCursor = line.substring(0, position.character);
+    return beforeCursor.trimLeft().startsWith("//");
+  }
+
+  private generateFunctionUsageExample(func: {
+    name: string;
+    params: string[];
+  }): string {
+    const exampleParams = func.params.map((param) => {
+      if (param.includes("number")) return "42";
+      if (param.includes("string")) return '"example"';
+      if (param.includes("array") || param.includes("[]")) return "[1, 2, 3]";
+      if (param.includes("boolean")) return "true";
+      return "undefined";
+    });
+
+    return `// Example usage:
+${func.name}(${exampleParams.join(", ")});
+
+// Test cases:
+console.log(${func.name}(${exampleParams.join(", ")}));`;
+  }
+
+  private async buildCompletionPrompt(
+    document: vscode.TextDocument,
+    position: vscode.Position,
+    currentLine: string,
+    commentContext: string,
+    language: string
+  ): Promise<string> {
+    const { functionNames, variables, codeIntent, recentlyDefinedFunction } =
+      this.analyzeCodeBlock(document, position);
+
+    if (this.isInsideComment(document, position)) {
+      return `Complete this documentation comment:\n${currentLine}`;
+    }
+
+    if (recentlyDefinedFunction && this.lastDefinedFunction) {
+      return `Function ${this.lastDefinedFunction.name} was just defined.
+Generate example usage and test cases.
+${this.generateFunctionUsageExample(this.lastDefinedFunction)}`;
+    }
+
+    return `File type: ${language}
+Code Context:
+- Defined functions: ${functionNames.join(", ")}
+- Available variables: ${variables.join(", ")}
+- Current intent: ${codeIntent}
+
+Previous code context:
+${document.getText(
+  new vscode.Range(
+    new vscode.Position(Math.max(0, position.line - 5), 0),
+    position
+  )
+)}
+
+Current line:
+${currentLine}
+
+Instructions:
+1. Continue the logical flow of the existing code
+2. If a function was just defined, suggest its usage
+3. Keep the context of the previously defined functions
+4. Don't introduce unrelated concepts
+5. Complete or use existing functions if appropriate
+
+Complete this code:`;
+  }
+
   async provideInlineCompletionItems(
     document: vscode.TextDocument,
     position: vscode.Position,
@@ -210,21 +341,24 @@ class CompletionProvider implements vscode.InlineCompletionItemProvider {
       const { language, basePrompt } = this.getLanguageContext(document);
 
       try {
-        this.lastRequest = axios.CancelToken.source();
+        const completionPrompt = await this.buildCompletionPrompt(
+          document,
+          position,
+          currentLineUptoCursor,
+          commentContext,
+          language
+        );
 
         const systemPrompt = `${basePrompt}
+${SYSTEM_PROMPT}
+Additional Rules:
+1. Always maintain context with previously defined functions
+2. If a function was just defined, suggest its usage
+3. Don't introduce unrelated concepts
+4. Focus on completing or using existing code
+5. Keep the logical flow of the current code block`;
 
-Code Generation Rules:
-1. Output only valid, compilable ${language} code
-2. Follow established ${language} naming patterns
-3. Complete full logical blocks (if started)
-4. Match existing code style
-5. No comments or explanations in output
-6. No markdown formatting
-
-Current file type: ${language}
-Current file extension: ${document.uri.fsPath.split(".").pop()}
-IMPORTANT: For console.log statements, only complete the string content. Do not nest functions.`;
+        this.lastRequest = axios.CancelToken.source();
 
         const response = await axios.post(
           `${LOCALHOST_URL}/chat/completions`,
@@ -236,12 +370,7 @@ IMPORTANT: For console.log statements, only complete the string content. Do not 
               },
               {
                 role: "user",
-                content: `File type: ${language}
-Context:
-${commentContext}
-Current line:
-${currentLineUptoCursor}
-Complete this code:`,
+                content: completionPrompt,
               },
             ],
             model: "codellama-7b-instruct",
