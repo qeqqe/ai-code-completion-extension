@@ -46,7 +46,7 @@ lerna-debug.log*
 # temp directory
 .temp
 .tmp
-
+pnpm-lock.yaml
 # Runtime data
 pids
 *.pid

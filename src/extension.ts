@@ -4,6 +4,20 @@ import axios, { CancelTokenSource } from "axios";
 const LOCALHOST_URL = "http://localhost:1234/v1";
 const DEBOUNCE_DELAY = 300;
 
+const BASE_PROMPTS = {
+  typescript: `You are a TypeScript code completion AI. Generate TypeScript code with:
+- Proper type annotations
+- Interface definitions when needed
+- Type-safe operations
+- Modern TypeScript patterns`,
+  javascript: `You are a JavaScript code completion AI. Generate JavaScript code with:
+- ES6+ modern syntax
+- No TypeScript types
+- JavaScript-specific patterns
+- Runtime-friendly code`,
+  // will add more
+} as const;
+
 interface CompletionRequest {
   messages: {
     role: "system" | "user";
@@ -57,6 +71,7 @@ class CompletionProvider implements vscode.InlineCompletionItemProvider {
   private outputChannel: vscode.OutputChannel;
   private lastRequest: CancelTokenSource | null = null;
   private debounceTimeout: NodeJS.Timeout | null = null;
+  private currentLanguage: string = "javascript";
 
   constructor() {
     this.outputChannel = vscode.window.createOutputChannel(
@@ -84,6 +99,86 @@ class CompletionProvider implements vscode.InlineCompletionItemProvider {
     };
   }
 
+  private cleanCompletion(completion: string): string {
+    let cleaned = completion
+      .replace(/```(?:typescript|javascript)?\n?/g, "")
+      .replace(/```\n?/g, "")
+      .replace(/^\n+/, "")
+      .replace(/\n+$/, "")
+      .replace(/^\s*\/\/.*$/gm, "");
+
+    if (cleaned.includes("function") && cleaned.includes("{")) {
+      const functionMatch = cleaned.match(/^[^{]*{[^}]*}$/);
+      if (functionMatch) {
+        cleaned = functionMatch[0];
+      }
+    }
+
+    if (cleaned.includes("console.log(")) {
+      const stringMatch = cleaned.match(/console\.log\((["'])(.*?)\1\)/);
+      if (stringMatch) {
+        return `console.log("${stringMatch[2]}")`;
+      }
+    }
+
+    if (this.currentLanguage === "javascript") {
+      cleaned = cleaned
+        .replace(/: \w+(?=[\s,)])/g, "")
+        .replace(/<[^>]+>/g, "")
+        .replace(/: \w+\[\]/g, "")
+        .replace(/interface \w+ {[^}]+}/g, "");
+    }
+
+    return cleaned;
+  }
+
+  private getContextFromComments(
+    document: vscode.TextDocument,
+    position: vscode.Position
+  ): string {
+    let lineNumber = position.line;
+    let context = "";
+
+    while (lineNumber >= 0 && lineNumber > position.line - 5) {
+      const line = document.lineAt(lineNumber).text.trim();
+      if (line.startsWith("//")) {
+        context = line + "\n" + context;
+      } else if (context) {
+        break;
+      }
+      lineNumber--;
+    }
+
+    return context;
+  }
+
+  private getLanguageContext(document: vscode.TextDocument): {
+    language: string;
+    basePrompt: string;
+  } {
+    const languageId = document.languageId;
+    const fileExtension =
+      document.uri.fsPath.split(".").pop()?.toLowerCase() || "";
+
+    let language = "javascript";
+    if (
+      languageId === "typescript" ||
+      fileExtension === "ts" ||
+      fileExtension === "tsx"
+    ) {
+      language = "typescript";
+    }
+
+    this.currentLanguage = language;
+
+    return {
+      language,
+      basePrompt:
+        BASE_PROMPTS[language as keyof typeof BASE_PROMPTS] ||
+        BASE_PROMPTS.javascript,
+    };
+  }
+
   async provideInlineCompletionItems(
     document: vscode.TextDocument,
     position: vscode.Position,
@@ -92,40 +187,61 @@ class CompletionProvider implements vscode.InlineCompletionItemProvider {
   ): Promise<vscode.InlineCompletionItem[]> {
     const debouncedCompletion = this.debounce(async () => {
       const currentLine = document.lineAt(position.line).text;
-      const precedingText = document.getText(
-        new vscode.Range(
-          new vscode.Position(Math.max(0, position.line - 10), 0),
-          position
-        )
+      const currentLineUptoCursor = currentLine.substring(
+        0,
+        position.character
       );
 
-      if (!currentLine.trim() || currentLine.trim().length < 2) {
+      const commentContext = this.getContextFromComments(document, position);
+      const isEmptyLine = !currentLine.trim();
+
+      if (
+        !commentContext &&
+        !isEmptyLine &&
+        currentLineUptoCursor.trim().length < 2
+      ) {
         return [];
       }
 
-      const imports =
-        document
-          .getText()
-          .match(/import.*from.*;/g)
-          ?.join("\n") || "";
-      const currentScope = document.getText(
-        new vscode.Range(
-          new vscode.Position(Math.max(0, position.line - 20), 0),
-          position
-        )
-      );
+      const openBrackets = (currentLineUptoCursor.match(/{/g) || []).length;
+      const closeBrackets = (currentLineUptoCursor.match(/}/g) || []).length;
+      const isInsideFunction = openBrackets > closeBrackets;
+
+      const { language, basePrompt } = this.getLanguageContext(document);
 
       try {
         this.lastRequest = axios.CancelToken.source();
+
+        const systemPrompt = `${basePrompt}
+
+Code Generation Rules:
+1. Output only valid, compilable ${language} code
+2. Follow established ${language} naming patterns
+3. Complete full logical blocks (if started)
+4. Match existing code style
+5. No comments or explanations in output
+6. No markdown formatting
+
+Current file type: ${language}
+Current file extension: ${document.uri.fsPath.split(".").pop()}
+IMPORTANT: For console.log statements, only complete the string content. Do not nest functions.`;
 
         const response = await axios.post(
           `${LOCALHOST_URL}/chat/completions`,
           {
             messages: [
-              { role: "system", content: SYSTEM_PROMPT },
+              {
+                role: "system",
+                content: systemPrompt,
+              },
               {
                 role: "user",
-                content: `Previous context:\n${precedingText}\nScope: ${currentScope}\nImports: ${imports}\nComplete this code:`,
+                content: `File type: ${language}
+Context:
+${commentContext}
+Current line:
+${currentLineUptoCursor}
+Complete this code:`,
               },
             ],
             model: "codellama-7b-instruct",
@@ -140,22 +256,59 @@ class CompletionProvider implements vscode.InlineCompletionItemProvider {
           }
         );
 
-        const completion = response.data.choices[0]?.message?.content?.trim();
+        let completion = response.data.choices[0]?.message?.content;
 
         if (!completion) {
           return [];
         }
 
-        if (completion === currentLine) {
+        completion = this.cleanCompletion(completion)
+          .replace(/\r\n/g, "\n")
+          .replace(/^\s+/g, "");
+
+        if (currentLineUptoCursor.includes("console.log(")) {
+          if (!completion.endsWith(")")) {
+            completion += '")';
+          }
+          if (!completion.includes('"') && !completion.includes("'")) {
+            completion = `"${completion}`;
+          }
+        }
+
+        if (isEmptyLine && commentContext) {
+          return [
+            new vscode.InlineCompletionItem(
+              completion,
+              new vscode.Range(position, position)
+            ),
+          ];
+        }
+
+        this.outputChannel.appendLine(
+          `Current line: "${currentLineUptoCursor}"`
+        );
+        this.outputChannel.appendLine(`Completion: "${completion}"`);
+
+        if (completion === currentLineUptoCursor || !completion.trim()) {
           return [];
         }
 
-        const range = new vscode.Range(
-          position.translate(0, -currentLine.length),
-          position
-        );
+        if (!completion.startsWith(currentLineUptoCursor.trimLeft())) {
+          completion = currentLineUptoCursor + completion;
+        }
 
-        return [new vscode.InlineCompletionItem(completion, range)];
+        this.outputChannel.appendLine(`Comment context: "${commentContext}"`);
+        this.outputChannel.appendLine(
+          `Current line: "${currentLineUptoCursor}"`
+        );
+        this.outputChannel.appendLine(`Completion: "${completion}"`);
+
+        return [
+          new vscode.InlineCompletionItem(
+            completion,
+            new vscode.Range(new vscode.Position(position.line, 0), position)
+          ),
+        ];
       } catch (error) {
         if (axios.isCancel(error)) {
           return [];
