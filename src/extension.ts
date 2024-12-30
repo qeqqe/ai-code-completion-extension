@@ -69,11 +69,18 @@ Database/API:
 
 Current Focus: Complete only the immediate code need, no explanations`;
 
+interface ModelInfo {
+  id: string;
+  name: string;
+  // Add other model properties as needed
+}
+
 class CompletionProvider implements vscode.InlineCompletionItemProvider {
   private outputChannel: vscode.OutputChannel;
   private lastRequest: CancelTokenSource | null = null;
   private debounceTimeout: NodeJS.Timeout | null = null;
   private currentLanguage: string = "javascript";
+  private currentModel: string = "default";
   private lastDefinedFunction: {
     name: string;
     params: string[];
@@ -85,6 +92,21 @@ class CompletionProvider implements vscode.InlineCompletionItemProvider {
     this.outputChannel = vscode.window.createOutputChannel(
       "LM Studio Completions"
     );
+    this.detectCurrentModel();
+  }
+
+  private async detectCurrentModel(): Promise<void> {
+    try {
+      const response = await axios.get(`${LOCALHOST_URL}/models`);
+      const models: ModelInfo[] = response.data;
+      if (models && models.length > 0) {
+        // Get the first loaded model or the one marked as active
+        this.currentModel = models[0].id;
+        this.outputChannel.appendLine(`Detected model: ${this.currentModel}`);
+      }
+    } catch (error) {
+      this.outputChannel.appendLine(`Error detecting model: ${error}`);
+    }
   }
 
   private debounce<T extends (...args: any[]) => Promise<any>>(
@@ -373,7 +395,7 @@ Additional Rules:
                 content: completionPrompt,
               },
             ],
-            model: "codellama-7b-instruct",
+            model: this.currentModel, // Use detected model instead of hardcoded one
             temperature: 0.1,
             max_tokens: 150,
             stream: false,
@@ -455,7 +477,13 @@ Additional Rules:
 
 export async function activate(context: vscode.ExtensionContext) {
   try {
-    await axios.get(`${LOCALHOST_URL}/models`);
+    // Check if LM Studio is running and get available models
+    const modelsResponse = await axios.get(`${LOCALHOST_URL}/models`);
+    const models: ModelInfo[] = modelsResponse.data;
+
+    if (!models || models.length === 0) {
+      throw new Error("No models loaded in LM Studio");
+    }
 
     const provider = new CompletionProvider();
     const disposable = vscode.languages.registerInlineCompletionItemProvider(
@@ -466,11 +494,11 @@ export async function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(disposable);
 
     vscode.window.showInformationMessage(
-      "LM Studio Completions activated! Start typing to see suggestions."
+      `LM Studio Completions activated! Using model: ${models[0].name}`
     );
   } catch (error) {
     vscode.window.showErrorMessage(
-      "Failed to connect to LM Studio. Make sure it's running on port 1234."
+      "Failed to connect to LM Studio. Make sure it's running and has a model loaded."
     );
   }
 }
